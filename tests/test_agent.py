@@ -8,6 +8,7 @@ import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
 
 import agent
 import load_seed
@@ -23,6 +24,12 @@ BUG = {
     "priority": "P4",
     "route": "bug-team",
     "rationale": "The ticket describes a broken behavior with a workaround.",
+}
+OUTAGE = {
+    "category": "access",
+    "priority": "P1",
+    "route": "access-team",
+    "rationale": "A whole team locked out is an outage for an Enterprise customer.",
 }
 
 
@@ -69,16 +76,21 @@ class ResponseDrivenModel(GenericFakeChatModel):
         return ChatResult(generations=[ChatGeneration(message=response)])
 
 
-def scripted(ticket_id, customer_id, decision):
-    return ScriptedModel(
-        messages=iter(
-            [
-                _call("get_ticket", {"ticket_id": ticket_id}, "1"),
-                _call("get_customer_history", {"customer_id": customer_id}, "2"),
-                _call("TriageDecision", decision, "3"),
-            ]
+def scripted(ticket_id, customer_id, decision, escalate=False):
+    turns = [
+        _call("get_ticket", {"ticket_id": ticket_id}, "1"),
+        _call("get_customer_history", {"customer_id": customer_id}, "2"),
+    ]
+    if escalate:
+        turns.append(
+            _call(
+                "escalate_to_human",
+                {"ticket_id": ticket_id, "reason": "P1 for an Enterprise customer"},
+                "3",
+            )
         )
-    )
+    turns.append(_call("TriageDecision", decision, "4" if escalate else "3"))
+    return ScriptedModel(messages=iter(turns))
 
 
 def invalid_scripted(ticket_id, customer_id):
@@ -184,3 +196,81 @@ def test_unknown_ticket_returns_a_clear_lookup_error(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "build_model", lambda: pytest.fail("model should not be built"))
     with pytest.raises(Exception, match="T-0000"):
         asyncio.run(agent.triage("T-0000"))
+
+
+def test_escalation_pauses_and_waits_for_approval():
+    asked = []
+    decision = asyncio.run(
+        agent.triage(
+            "T-1044",
+            scripted("T-1044", "C-91", OUTAGE, escalate=True),
+            approve=lambda request: asked.append(request["args"]) or True,
+        )
+    )
+    assert asked == [{"ticket_id": "T-1044", "reason": "P1 for an Enterprise customer"}]
+    assert decision == OUTAGE
+
+
+def test_declined_escalation_still_returns_a_decision():
+    decision = asyncio.run(
+        agent.triage(
+            "T-1044",
+            scripted("T-1044", "C-91", OUTAGE, escalate=True),
+            approve=lambda request: False,
+        )
+    )
+    assert decision == OUTAGE
+
+
+def test_no_escalation_for_a_non_p1_enterprise_ticket():
+    decision = asyncio.run(
+        agent.triage(
+            "T-1042",
+            scripted("T-1042", "C-77", BILLING, escalate=False),
+            approve=lambda request: pytest.fail("no escalation expected"),
+        )
+    )
+    assert decision == BILLING
+
+
+def test_escalation_without_an_approve_callback_fails_clearly():
+    with pytest.raises(ValueError, match="approval callback"):
+        asyncio.run(agent.triage("T-1044", scripted("T-1044", "C-91", OUTAGE, escalate=True)))
+
+
+def _spy_escalate_to_human(calls):
+    @tool("escalate_to_human")
+    def spy(ticket_id: str, reason: str) -> str:
+        """Spy replacement for escalate_to_human that records its calls."""
+        calls.append((ticket_id, reason))
+        return f"Escalated {ticket_id} to the on-call person: {reason}"
+
+    return spy
+
+
+def test_approving_actually_calls_the_real_escalation_tool(monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent, "escalate_to_human", _spy_escalate_to_human(calls))
+    decision = asyncio.run(
+        agent.triage(
+            "T-1044",
+            scripted("T-1044", "C-91", OUTAGE, escalate=True),
+            approve=lambda request: True,
+        )
+    )
+    assert calls == [("T-1044", "P1 for an Enterprise customer")]
+    assert decision == OUTAGE
+
+
+def test_declining_never_calls_the_real_escalation_tool(monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent, "escalate_to_human", _spy_escalate_to_human(calls))
+    decision = asyncio.run(
+        agent.triage(
+            "T-1044",
+            scripted("T-1044", "C-91", OUTAGE, escalate=True),
+            approve=lambda request: False,
+        )
+    )
+    assert calls == []
+    assert decision == OUTAGE
