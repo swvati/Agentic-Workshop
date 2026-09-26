@@ -1,0 +1,18 @@
+- id: "1"
+  title: Triage decision schema
+  description: >-
+    Implement and test CAP-1's JSON decision contract: allowed category,
+    priority, and route values, a one-sentence rationale, and clear rejection
+    of invalid decisions. Resolve the category-to-route mapping question in
+    SPEC.md before locking that part of the contract.
+  spec_checkpoint: false
+  done_checkpoint: false
+- id: "2"
+  title: Load seed data
+  description: >-
+    Implement CAP-2's `uv run python load_seed.py` command to load both
+    read-only seed CSVs into the `tickets` and `customers` tables in `app.db`,
+    preserving CSV columns and compatibility with the existing triage server.
+    Verify that rerunning the command leaves the same database.
+  spec_checkpoint: false
+  done_checkpoint: false
